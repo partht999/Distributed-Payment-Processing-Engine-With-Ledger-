@@ -1,0 +1,28 @@
+# ─── Internal / Learning Files (kept locally, not in repo) ───
+Learning Java/
+documentation/
+.vscode/
+
+# ─── Build & Runtime ───
+*.log
+debug.log
+target/
+*.jar
+*.war
+
+# ─── IDE ───
+.idea/
+*.iws
+*.iml
+*.ipr
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
