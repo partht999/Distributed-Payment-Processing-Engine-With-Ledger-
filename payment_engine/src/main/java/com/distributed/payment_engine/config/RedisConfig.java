@@ -2,66 +2,85 @@ package com.distributed.payment_engine.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
 
 /**
  * Redis Configuration for the Payment Engine.
  *
- * This class configures how Spring Data Redis connects to and communicates
- * with the Redis instance. We define two templates:
+ * Configures THREE Redis use cases:
  *
- * 1. RedisTemplate<String, Object> — For storing complex objects as JSON.
- *    Uses StringRedisSerializer for keys (human-readable in redis-cli)
- *    and GenericJackson2JsonRedisSerializer for values (automatic JSON
- *    serialization/deserialization with type information).
+ * 1. RedisTemplate<String, Object>  — For storing complex objects as JSON.
+ * 2. StringRedisTemplate            — For idempotency keys (SET NX EX) and processing markers.
+ * 3. RedisCacheManager              — For Spring @Cacheable read-through caching.
  *
- * 2. StringRedisTemplate — For simple string key-value operations.
- *    This is what we'll use for idempotency keys (SET NX EX) and
- *    processing markers in upcoming days.
+ * CACHING STRATEGY:
+ * ┌────────────────────────────────────────────────────────────────────┐
+ * │  GET /wallets/{id}                                                │
+ * │  ├── Check Redis cache (key: "wallets::42")                       │
+ * │  │   ├── HIT  → Return cached wallet (sub-millisecond, no DB)    │
+ * │  │   └── MISS → Query PostgreSQL → Store in Redis → Return       │
+ * │  │                                                                │
+ * │  POST /wallets/{id}/deposit (or transfer/withdraw)                │
+ * │  ├── @CacheEvict("wallets") → Invalidates cached wallet data     │
+ * │  └── Next GET will re-query DB and refresh cache                  │
+ * └────────────────────────────────────────────────────────────────────┘
  *
- * The RedisConnectionFactory is auto-configured by Spring Boot from the
- * application.properties settings (spring.data.redis.*). It uses the
- * Lettuce client (non-blocking, Netty-based) by default.
- *
- * WHY LETTUCE OVER JEDIS?
- * - Lettuce is non-blocking (uses Netty under the hood)
- * - Thread-safe: single connection shared across threads
- * - Supports reactive and async operations
- * - Default in Spring Boot since version 2.0
+ * Cache TTL: 10 minutes (configurable via spring.cache.redis.time-to-live)
+ * This ensures stale data is automatically evicted even if a write bypasses
+ * the cache eviction (e.g., direct DB update via SQL migration).
  */
 @Configuration
 public class RedisConfig {
 
     /**
+     * RedisCacheManager for Spring @Cacheable annotations.
+     *
+     * Values are serialized as JSON so they can be inspected in redis-cli.
+     * Keys use the format: {cacheName}::{key} (e.g., "wallets::42")
+     *
+     * TTL = 10 minutes. After expiry, the next read will hit PostgreSQL
+     * and repopulate the cache. This provides a safety net against
+     * stale cache entries that weren't explicitly evicted.
+     */
+    @Bean
+    public RedisCacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(10))
+                .serializeKeysWith(
+                        RedisSerializationContext.SerializationPair
+                                .fromSerializer(new StringRedisSerializer()))
+                .serializeValuesWith(
+                        RedisSerializationContext.SerializationPair
+                                .fromSerializer(new GenericJackson2JsonRedisSerializer()))
+                .disableCachingNullValues();
+
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(config)
+                .build();
+    }
+
+    /**
      * RedisTemplate for storing complex Java objects in Redis.
      *
-     * Key serialization: StringRedisSerializer
-     *   - Keys are always strings (e.g., "idempotency:abc-123")
-     *   - Human-readable when inspecting via redis-cli
-     *
-     * Value serialization: GenericJackson2JsonRedisSerializer
-     *   - Automatically serializes any Java object to JSON
-     *   - Includes @class type info for deserialization
-     *   - Supports nested objects, lists, maps, etc.
-     *
-     * Hash key/value: Same serializers for hash operations
-     *
-     * We'll use this template in later days for storing:
-     *   - Idempotency responses *   - Processing markers *   - Distributed lock metadata */
+     * Key serialization:   StringRedisSerializer (human-readable in redis-cli)
+     * Value serialization: GenericJackson2JsonRedisSerializer (automatic JSON)
+     */
     @Bean
     public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
         RedisTemplate<String, Object> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
 
-        // Keys are always plain strings — readable in redis-cli
         template.setKeySerializer(new StringRedisSerializer());
         template.setHashKeySerializer(new StringRedisSerializer());
-
-        // Values are JSON — supports any Java object
         template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
         template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
 
@@ -72,14 +91,10 @@ public class RedisConfig {
     /**
      * StringRedisTemplate for simple string-to-string operations.
      *
-     * This is a convenience template where both keys and values are strings.
-     * Perfect for:
+     * Used for:
      *   - SET key NX EX 300 (idempotency with TTL)
      *   - Simple flags and counters
      *   - Processing marker keys ("processing:payment:42")
-     *
-     * Spring Boot auto-configures this bean, but we define it explicitly
-     * for clarity and to make the config self-documenting.
      */
     @Bean
     public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
