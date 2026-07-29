@@ -1,0 +1,9 @@
+# Don't send these to Docker build context
+target/
+.git/
+.gitignore
+*.md
+.mvn/wrapper/maven-wrapper.jar
+k6-load-test.js
+e2e-demo.sh
+monitoring/

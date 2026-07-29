@@ -1,0 +1,14 @@
+# Prometheus Configuration — Payment Engine Metrics
+# Scrapes Spring Boot Actuator's /actuator/prometheus endpoint
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'payment-engine'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['payment-engine:8080']
+        labels:
+          application: 'payment-engine'

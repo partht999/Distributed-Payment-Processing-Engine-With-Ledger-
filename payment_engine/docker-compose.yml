@@ -1,6 +1,23 @@
 version: '3.8'
 
+# ═══════════════════════════════════════════════════════════════════
+# Distributed Payment Processing Engine — Full Stack
+# ═══════════════════════════════════════════════════════════════════
+# One command to boot the entire system:
+#   docker compose up --build
+#
+# Services:
+#   - payment-engine  : Spring Boot app (port 8080)
+#   - postgres         : PostgreSQL 15 (port 5433)
+#   - redis            : Redis 7 (port 6379)
+#   - kafka            : Apache Kafka 3.7 KRaft (port 9092)
+#   - prometheus       : Metrics collector (port 9090)
+#   - grafana          : Dashboards (port 3000)
+# ═══════════════════════════════════════════════════════════════════
+
 services:
+
+  # ─── PostgreSQL — ACID Source of Truth ───
   postgres:
     image: postgres:15-alpine
     container_name: payment_engine_db
@@ -13,7 +30,14 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
+  # ─── Redis — Cache + Locks + Idempotency ───
   redis:
     image: redis:7-alpine
     container_name: payment_engine_redis
@@ -30,38 +54,25 @@ services:
       start_period: 5s
     command: redis-server --appendonly yes
 
-  # ═══ DAY 59: Kafka (KRaft mode — no ZooKeeper needed) ═══
-  # KRaft = Kafka Raft — Kafka manages its own metadata instead of relying on ZooKeeper.
-  # This is the modern way to run Kafka (KIP-500, production-ready since Kafka 3.3).
+  # ─── Kafka — KRaft Mode (No ZooKeeper) ───
   kafka:
     image: apache/kafka:3.7.0
     container_name: payment_engine_kafka
     ports:
       - "9092:9092"
     environment:
-      # ── KRaft Configuration ──
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-
-      # ── Listener Configuration ──
-      # PLAINTEXT = for our Spring Boot app (from host machine via port 9092)
-      # CONTROLLER = for internal KRaft consensus (port 9093, never exposed)
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-
-      # ── Topic Defaults ──
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-
-      # ── Auto-create our payment events topic ──
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-
-      # ── Cluster ID (required for KRaft) ──
       CLUSTER_ID: "payment-engine-kafka-cluster-01"
     volumes:
       - kafka_data:/var/lib/kafka/data
@@ -73,7 +84,73 @@ services:
       retries: 5
       start_period: 30s
 
+  # ─── Payment Engine — Spring Boot Application ───
+  payment-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: payment_engine_app
+    ports:
+      - "8080:8080"
+    environment:
+      # Override application.properties for Docker networking
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_engine
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Actuator for Prometheus scraping
+      MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,prometheus,metrics
+      MANAGEMENT_METRICS_EXPORT_PROMETHEUS_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+
+  # ─── Prometheus — Metrics Collection ───
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: payment_engine_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    depends_on:
+      - payment-engine
+    restart: unless-stopped
+
+  # ─── Grafana — Dashboards & Visualization ───
+  grafana:
+    image: grafana/grafana:latest
+    container_name: payment_engine_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
   kafka_data:
+  prometheus_data:
+  grafana_data:
